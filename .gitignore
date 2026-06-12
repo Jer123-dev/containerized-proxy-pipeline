@@ -1,0 +1,10 @@
+# Local environment variables
+.env
+
+# Container state persistence directories
+*_data/
+*_config/
+
+# System files
+.DS_Store
+Thumbs.db

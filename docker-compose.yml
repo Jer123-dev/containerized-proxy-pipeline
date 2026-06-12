@@ -1,0 +1,137 @@
+version: "3.8"
+
+services:
+  # ==========================================
+  # THE PROXY LAYER
+  # ==========================================
+  proxy-tunnel:
+    image: ghcr.io/xjasonlyu/tun2socks:latest
+    container_name: secure_proxy_tunnel
+    restart: always
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - PROXY_URL=socks5://${PROXY_USER}:${PROXY_PASSWORD}@${PROXY_IP}:${PROXY_PORT}
+      - PROXY_IP=${PROXY_IP}
+    entrypoint: /bin/sh
+    command: 
+      - -c
+      - |
+        # 1. Initialize TUN device for virtual networking
+        mkdir -p /dev/net
+        mknod /dev/net/tun c 10 200 2>/dev/null
+        
+        # 2. Capture default gateway
+        GW=$$(ip route show default | awk '/default/ {print $$3}')
+        
+        # 3. Whitelist proxy IP to bypass the tunnel
+        ip route add $$PROXY_IP/32 via $$GW
+        
+        # 4. Start tun2socks to route traffic into the proxy
+        tun2socks -device tun://tun0 -proxy $$PROXY_URL -interface eth0 &
+        
+        # 5. Wait for interface initialization
+        sleep 5
+        ip link set tun0 up
+        
+        # 6. Reroute all default traffic through the tunnel
+        ip route del default
+        ip route add default dev tun0
+        
+        echo "Strict Network Namespace Tunnel Active."
+        wait
+
+  # ==========================================
+  # THE EDGE NODES (Network Isolated)
+  # ==========================================
+  
+  traffmonetizer:
+    image: traffmonetizer/cli_v2
+    container_name: tm_edge_node
+    restart: always
+    # Forces this container to use the proxy-tunnel's network stack
+    network_mode: service:proxy-tunnel
+    depends_on:
+      - proxy-tunnel
+    command: start accept --token ${TRAFFMONETIZER_TOKEN}
+
+  repocket:
+    image: repocket/repocket
+    container_name: repocket_edge_node
+    restart: always
+    network_mode: service:proxy-tunnel
+    depends_on:
+      - proxy-tunnel
+    environment:
+      - RP_EMAIL=${REPOCKET_EMAIL}
+      - RP_API_KEY=${REPOCKET_API_KEY}
+
+  packetstream:
+    image: packetstream/psclient
+    container_name: ps_edge_node
+    restart: always
+    network_mode: service:proxy-tunnel
+    depends_on:
+      - proxy-tunnel
+    environment:
+      - CID=${PACKETSTREAM_CID}
+
+  gaganode:
+    image: xterna/gaga-node:latest
+    container_name: gaganode_edge_node
+    restart: always
+    network_mode: service:proxy-tunnel
+    depends_on:
+      - proxy-tunnel
+    environment:
+      - TOKEN=${GAGANODE_TOKEN}
+
+  # ==========================================
+  # THE DIRECT NODES (Datacenter IP)
+  # ==========================================
+
+  titan:
+    image: nezha123/titan-edge
+    container_name: titan_direct_node
+    restart: always
+    volumes:
+      - ./titan_data:/root/.titanedge
+
+  bitping:
+    image: bitping/bitpingd:latest
+    container_name: bitping_direct_node
+    restart: always
+    volumes:
+      - ./bitping_data:/root/.bitpingd
+
+  # ==========================================
+  # THE HEAVY COMPUTE LAYER
+  # ==========================================
+  
+  chromium:
+    image: lscr.io/linuxserver/chromium:latest
+    container_name: chromium_compute
+    restart: always
+    security_opt:
+      - seccomp:unconfined # Required for Chromium
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - ./chromium_config:/config
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    # Resource Governance to prevent OOM kills on 4GB VPS
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1536M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
